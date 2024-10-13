@@ -1,5 +1,5 @@
 # Rust Chess Engine
-A chess engine written in Rust, using Macroquad. Has a graphical window.
+A chess engine written in [Rust](https://www.rust-lang.org/), using [Macroquad](https://macroquad.rs/). Has a graphical window.
 
 ## Attributions
 Chess Pieces, originally as .svg files from Wikimedia, modified to 100x100 png files.
