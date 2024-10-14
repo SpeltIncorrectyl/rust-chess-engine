@@ -263,16 +263,16 @@ impl Piece {
         }
     }
 
-    pub fn get_capure_destinations(&self, board: &Board, position: UVec2) -> Vec<UVec2> {
+    pub fn get_capure_destinations(&self, board: &Board, position: UVec2, capture_mode: ObstructionHandling) -> Vec<UVec2> {
         match self {
-            Piece::WhiteKing | Piece::BlackKing => generate_line_moves_sets(board, *self, position, Directions::All.to_vecs(), ObstructionHandling::Capture, 1),
-            Piece::WhiteQueen | Piece::BlackQueen => generate_line_moves_sets(board, *self, position, Directions::All.to_vecs(), ObstructionHandling::Capture, 8),
-            Piece::WhiteKnight | Piece::BlackKnight => generate_line_moves_sets(board,*self,  position, Directions::Knight.to_vecs(), ObstructionHandling::Capture, 1),
-            Piece::WhiteRook | Piece::BlackRook => generate_line_moves_sets(board, *self, position, Directions::Straight.to_vecs(), ObstructionHandling::Capture, 8),
-            Piece::WhiteBishop | Piece::BlackBishop => generate_line_moves_sets(board, *self, position, Directions::Diagonal.to_vecs(), ObstructionHandling::Capture, 8),
+            Piece::WhiteKing | Piece::BlackKing => generate_line_moves_sets(board, *self, position, Directions::All.to_vecs(), capture_mode, 1),
+            Piece::WhiteQueen | Piece::BlackQueen => generate_line_moves_sets(board, *self, position, Directions::All.to_vecs(), capture_mode, 8),
+            Piece::WhiteKnight | Piece::BlackKnight => generate_line_moves_sets(board,*self,  position, Directions::Knight.to_vecs(), capture_mode, 1),
+            Piece::WhiteRook | Piece::BlackRook => generate_line_moves_sets(board, *self, position, Directions::Straight.to_vecs(), capture_mode, 8),
+            Piece::WhiteBishop | Piece::BlackBishop => generate_line_moves_sets(board, *self, position, Directions::Diagonal.to_vecs(), capture_mode, 8),
 
-            Piece::WhitePawn => generate_line_moves_sets(board, *self, position, vec![IVec2::new(-1, -1), IVec2::new(1, -1)], ObstructionHandling::Capture, 1),
-            Piece::BlackPawn => generate_line_moves_sets(board, *self, position, vec![IVec2::new(-1, 1), IVec2::new(1, 1)], ObstructionHandling::Capture, 1)
+            Piece::WhitePawn => generate_line_moves_sets(board, *self, position, vec![IVec2::new(-1, -1), IVec2::new(1, -1)], capture_mode, 1),
+            Piece::BlackPawn => generate_line_moves_sets(board, *self, position, vec![IVec2::new(-1, 1), IVec2::new(1, 1)], capture_mode, 1)
         }
     }
 
@@ -350,12 +350,30 @@ pub fn is_position_blocked_by_enemy(board: &Board, piece: Piece, position: IVec2
     }
 }
 
+pub fn get_all_check_locations(board: &Board, piece: Piece) -> Vec<UVec2> {
+    let mut positions = Vec::new();
+
+    for x in 0..board.horizontal_cell_count {
+        for y in 0..=board.vertical_cell_count {
+            let position = UVec2::new(x, y);
+            if let Some(other_piece) = board.get_piece(position) {
+                if other_piece.get_faction() != piece.get_faction() {
+                    positions.append(&mut other_piece.get_capure_destinations(board, position, ObstructionHandling::Check));
+                }
+            }
+        }
+    }
+
+    return positions;
+}
+
 #[derive(PartialEq, Clone, Copy)]
 pub enum ObstructionHandling {
     Ignore,
     Hop,
     Stop,
     Capture,
+    Check
 }
 
 impl ObstructionHandling {
@@ -364,7 +382,8 @@ impl ObstructionHandling {
             ObstructionHandling::Ignore => false,
             ObstructionHandling::Hop => false,
             ObstructionHandling::Stop => false,
-            ObstructionHandling::Capture => true
+            ObstructionHandling::Capture => true,
+            ObstructionHandling::Check => false
         }
     }
 }
@@ -378,7 +397,7 @@ pub fn generate_line_moves(board: &Board, piece: Piece, start_position: UVec2, d
             continue;
         }
 
-        if is_position_blocked(board, position) && blocking == ObstructionHandling::Stop {
+        if is_position_blocked(board, position) && (blocking == ObstructionHandling::Stop || blocking == ObstructionHandling::Check) {
             break;
         } else if is_position_blocked(board, position) && blocking == ObstructionHandling::Hop {
             continue;
@@ -524,7 +543,9 @@ pub async fn main() {
 
         if let (None, true, Some(position)) = (maybe_held_piece, is_mouse_button_pressed(MouseButton::Left), maybe_position) {
         if let Some(piece) = board.get_piece(position) {
-                maybe_held_piece = Some(HeldPiece::new(maybe_position.unwrap(), board.get_tile_position(maybe_position.unwrap()) - mouse_position, piece));
+                if piece.get_faction() == current_player {
+                    maybe_held_piece = Some(HeldPiece::new(maybe_position.unwrap(), board.get_tile_position(maybe_position.unwrap()) - mouse_position, piece));
+                }
             }
         }
 
@@ -542,15 +563,17 @@ pub async fn main() {
         let mut maybe_capturing_moves: Option<Vec<UVec2>> = None;
         if let Some(drawn_moves_piece) = maybe_drawn_moves_piece {
             if let Some(piece) = board.get_piece(drawn_moves_piece) {
-                maybe_moves = Some(piece.get_movement_destinations(&board, drawn_moves_piece));
-                maybe_castling_moves = Some(piece.get_castling_destinations(&board));
-                maybe_capturing_moves = Some(piece.get_capure_destinations(&board, drawn_moves_piece));
+                if piece.get_faction() == current_player {
+                    maybe_moves = Some(piece.get_movement_destinations(&board, drawn_moves_piece));
+                    maybe_castling_moves = Some(piece.get_castling_destinations(&board));
+                    maybe_capturing_moves = Some(piece.get_capure_destinations(&board, drawn_moves_piece, ObstructionHandling::Capture));
+                }
             }
         }
 
         if let (Some(moves), Some(castling_moves), Some(capturing_moves)) = (&maybe_moves, &maybe_castling_moves, &maybe_capturing_moves) {
             draw_moves(&board, moves.iter().cloned(), Color::from_hex(0x7df5b3));
-            draw_moves(&board, capturing_moves.iter().cloned(), Color::from_hex(0xf55442));
+            draw_moves(&board, capturing_moves.iter().cloned(), Color::from_hex(0x4287f5));
             draw_moves(&board, castling_moves.iter().map(|(king_to, _, _, _)| king_to.clone()), Color::from_hex(0xda42f5));
         }
 
@@ -565,7 +588,7 @@ pub async fn main() {
 
         let mut maybe_current_move: Option<Move> = None;
         if let (Some(held_piece), true) = (maybe_held_piece, !is_mouse_button_down(MouseButton::Left)) {
-            if let (Some(position), Some(moves), Some(castling_moves), Some(capturing_moves)) = (maybe_position, &maybe_moves, &maybe_castling_moves, &maybe_capturing_moves) {
+            if let (Some(position), Some(moves), Some(castling_moves), Some(capturing_moves), true) = (maybe_position, &maybe_moves, &maybe_castling_moves, &maybe_capturing_moves, held_piece.piece.get_faction() == current_player) {
                 if moves.contains(&position) {
                     board.move_piece(held_piece.position, position);
                     maybe_current_move = Some(Move::Move(held_piece.piece, held_piece.position, position));
@@ -601,6 +624,13 @@ pub async fn main() {
         }
 
         if is_key_pressed(KeyCode::Z) {
+            if board.events.len() > 0 {
+                current_player = match current_player {
+                    Faction::White => Faction::Black,
+                    Faction::Black => Faction::White
+                };
+            }
+
             while let Some(event) = board.events.pop() {
                 match event {
                     Event::Move(Move::Move(_piece, from, to)) => {
@@ -622,11 +652,6 @@ pub async fn main() {
                     Event::BlockBlackKingSideCastle => board.black_king_side_castle_possible = true,
                     Event::BlockBlackQueenSideCastle => board.black_queen_side_castle_possible = true
                 }
-
-                current_player = match current_player {
-                    Faction::White => Faction::Black,
-                    Faction::Black => Faction::White
-                };
             }
         }
 
