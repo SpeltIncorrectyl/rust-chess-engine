@@ -1,3 +1,5 @@
+use std::thread::current;
+
 use macroquad::prelude::*;
 
 pub fn get_conf() -> Conf {
@@ -22,7 +24,9 @@ pub struct Board {
     pub white_queen_side_castle_possible: bool,
     pub black_king_side_castle_possible: bool,
     pub black_queen_side_castle_possible: bool,
-    pub events: Vec<Event>
+    pub events: Vec<Event>,
+    pub current_player: Faction,
+    pub game_state: GameState
 }
 
 impl Board {
@@ -38,7 +42,9 @@ impl Board {
             white_queen_side_castle_possible: true, 
             black_king_side_castle_possible: true, 
             black_queen_side_castle_possible: true,
-            events: Vec::new()
+            events: Vec::new(),
+            current_player: Faction::White,
+            game_state: GameState::Nominal
         }
     }
 
@@ -197,6 +203,66 @@ impl Board {
         };
 
         return displaced_piece;
+    }
+
+    pub fn undo(&mut self) {
+        while let Some(event) = self.events.pop() {
+            match event {
+                Event::Move(Move::Move(_piece, from, to)) => {
+                    self.move_piece(to, from);
+                    break;
+                },
+                Event::Move(Move::Castle(_king, king_from, king_to, _rook, rook_from, rook_to)) => {
+                    self.move_piece(king_to, king_from);
+                    self.move_piece(rook_to, rook_from);
+                    break;
+                },
+                Event::Move(Move::Capture(_, from, to, victim)) => {
+                    self.move_piece(to, from);
+                    self.add_piece(to, victim);
+                    break;
+                }
+                Event::BlockWhiteKingSideCastle => self.white_king_side_castle_possible = true,
+                Event::BlockWhiteQueenSideCastle => self.white_queen_side_castle_possible = true,
+                Event::BlockBlackKingSideCastle => self.black_king_side_castle_possible = true,
+                Event::BlockBlackQueenSideCastle => self.black_queen_side_castle_possible = true,
+                Event::GameEnded => self.game_state = GameState::Nominal
+            }
+        }
+    }
+
+    pub fn switch_player(&mut self) {
+        self.current_player = match self.current_player {
+            Faction::White => Faction::Black,
+            Faction::Black => Faction::White
+        }
+    }
+
+    pub fn find_piece(&self, piece: Piece) -> Option<UVec2> {
+        for y in 0..self.horizontal_cell_count {
+            for x in 0..self.vertical_cell_count {
+                let position = UVec2::new(x, y);
+                if self.get_piece(position).map_or(false, |x| x == piece) {
+                    return Some(position)
+                }
+            }
+        }
+        return None;
+    }
+
+    pub fn is_in_check(&self, faction: Faction) -> bool {
+        let king = match faction {
+            Faction::White => Piece::WhiteKing,
+            Faction::Black => Piece::BlackKing
+        };
+
+        let Some(position) = self.find_piece(king) else {
+            return false;
+        };
+
+        let check_moves = get_all_check_locations(self, king);
+
+        return check_moves.contains(&position);
     }
 }
 
@@ -397,7 +463,7 @@ pub fn generate_line_moves(board: &Board, piece: Piece, start_position: UVec2, d
             continue;
         }
 
-        if is_position_blocked(board, position) && (blocking == ObstructionHandling::Stop || blocking == ObstructionHandling::Check) {
+        if is_position_blocked(board, position) && blocking == ObstructionHandling::Stop {
             break;
         } else if is_position_blocked(board, position) && blocking == ObstructionHandling::Hop {
             continue;
@@ -407,7 +473,7 @@ pub fn generate_line_moves(board: &Board, piece: Piece, start_position: UVec2, d
             positions.push(position.as_uvec2());
         }
 
-        if is_position_blocked(board, position) && blocking == ObstructionHandling::Capture {
+        if is_position_blocked(board, position) && (blocking == ObstructionHandling::Capture || blocking == ObstructionHandling::Check) {
             break;
         }
     }
@@ -509,7 +575,44 @@ pub enum Event {
     BlockWhiteKingSideCastle,
     BlockWhiteQueenSideCastle,
     BlockBlackKingSideCastle,
-    BlockBlackQueenSideCastle
+    BlockBlackQueenSideCastle,
+    GameEnded
+}
+
+#[derive(PartialEq)]
+pub enum GameState {
+    Nominal,
+    WhiteCheckmated,
+    BlackCheckmated,
+    Statemate
+}
+
+pub enum AutoUndo {
+    Idle,
+    Waiting(f32)
+}
+
+impl AutoUndo {
+    pub fn is_waiting(&self) -> bool {
+        match self {
+            AutoUndo::Idle => false,
+            AutoUndo::Waiting(_) => true
+        }
+    }
+
+    pub fn is_ready(&self) -> bool {
+        match self {
+            AutoUndo::Waiting(0.0) => true,
+            _ => false
+        }
+    }
+
+    pub fn wait(&mut self, time: f32) {
+        *self = match self {
+            AutoUndo::Idle => AutoUndo::Idle,
+            AutoUndo::Waiting(wait) => AutoUndo::Waiting(f32::max(0.0, *wait - time))
+        }
+    }
 }
 
 #[macroquad::main(get_conf)]
@@ -520,9 +623,10 @@ pub async fn main() {
 
     let mut board = Board::new(Color::from_hex(0x759680), Color::from_hex(0xddede2), 125.0, 125.0, 8, 8);
     let mut maybe_held_piece: Option<HeldPiece> = None;
-    let mut current_player = Faction::White;
     board.generate_standard_piece_set();
     let textures = PieceTextures::new().await.expect("Failed to load textures.");
+    let auto_undo_delay: f32 = 0.1;
+    let mut auto_undo: AutoUndo = AutoUndo::Idle;
 
     loop {
         let (mouse_x, mouse_y) = mouse_position();
@@ -543,7 +647,7 @@ pub async fn main() {
 
         if let (None, true, Some(position)) = (maybe_held_piece, is_mouse_button_pressed(MouseButton::Left), maybe_position) {
         if let Some(piece) = board.get_piece(position) {
-                if piece.get_faction() == current_player {
+                if piece.get_faction() == board.current_player {
                     maybe_held_piece = Some(HeldPiece::new(maybe_position.unwrap(), board.get_tile_position(maybe_position.unwrap()) - mouse_position, piece));
                 }
             }
@@ -561,25 +665,79 @@ pub async fn main() {
         let mut maybe_moves: Option<Vec<UVec2>> = None;
         let mut maybe_castling_moves: Option<Vec<(UVec2, Piece, UVec2, UVec2)>> = None;
         let mut maybe_capturing_moves: Option<Vec<UVec2>> = None;
+        let mut maybe_blocked_moves: Option<Vec<UVec2>> = None;
         if let Some(drawn_moves_piece) = maybe_drawn_moves_piece {
             if let Some(piece) = board.get_piece(drawn_moves_piece) {
-                if piece.get_faction() == current_player {
-                    maybe_moves = Some(piece.get_movement_destinations(&board, drawn_moves_piece));
-                    maybe_castling_moves = Some(piece.get_castling_destinations(&board));
-                    maybe_capturing_moves = Some(piece.get_capure_destinations(&board, drawn_moves_piece, ObstructionHandling::Capture));
+                if piece.get_faction() == board.current_player {
+                    let mut blocked_moves = Vec::new();
+
+                    let mut moves = piece.get_movement_destinations(&board, drawn_moves_piece);
+                    moves.retain(|potential_move| {
+                        board.move_piece(drawn_moves_piece, *potential_move);
+                        let blocked = board.is_in_check(board.current_player);
+                        board.move_piece(*potential_move, drawn_moves_piece);
+                        if blocked {
+                            blocked_moves.push(*potential_move);
+                        }
+                        return !blocked;
+                    });
+
+                    let mut capturing_moves = piece.get_capure_destinations(&board, drawn_moves_piece, ObstructionHandling::Capture);
+                    capturing_moves.retain(|potential_move| {
+                        let maybe_defeated = board.move_piece(drawn_moves_piece, *potential_move);
+                        let blocked = board.is_in_check(board.current_player);
+                        board.move_piece(*potential_move, drawn_moves_piece);
+                        if let Some(defeated) = maybe_defeated {
+                            board.add_piece(*potential_move, defeated);
+                        }
+                        if blocked {
+                            blocked_moves.push(*potential_move);
+                        }
+                        return !blocked;
+                    });
+
+                    let mut castling_moves = piece.get_castling_destinations(&board);
+                    castling_moves.retain(|(king_to, _, rook_from, rook_to)| {
+                        board.move_piece(drawn_moves_piece, *king_to);
+                        board.move_piece(*rook_from, *rook_to);
+                        let blocked = board.is_in_check(board.current_player);
+                        board.move_piece(*king_to, drawn_moves_piece);
+                        board.move_piece(*rook_to, *rook_from);
+                        if blocked {
+                            blocked_moves.push(*king_to);
+                        }
+                        return !blocked;
+                    });
+
+                    if board.game_state == GameState::Nominal && moves.len() == 0 && capturing_moves.len() == 0 && capturing_moves.len() == 0 {
+                        if board.current_player == Faction::White && board.is_in_check(Faction::White) {
+                            board.game_state = GameState::WhiteCheckmated;
+                        } else if board.current_player == Faction::Black && board.is_in_check(Faction::Black) {
+                            board.game_state = GameState::BlackCheckmated; 
+                        } else {
+                            board.game_state = GameState::Statemate;
+                        }
+                        board.events.push(Event::GameEnded);
+                    }
+
+                    maybe_moves = Some(moves);
+                    maybe_castling_moves = Some(castling_moves);
+                    maybe_capturing_moves = Some(capturing_moves);
+                    maybe_blocked_moves = Some(blocked_moves);
                 }
             }
         }
 
-        if let (Some(moves), Some(castling_moves), Some(capturing_moves)) = (&maybe_moves, &maybe_castling_moves, &maybe_capturing_moves) {
+        if let (Some(moves), Some(castling_moves), Some(capturing_moves), Some(blocked_moves)) = (&maybe_moves, &maybe_castling_moves, &maybe_capturing_moves, maybe_blocked_moves) {
             draw_moves(&board, moves.iter().cloned(), Color::from_hex(0x7df5b3));
             draw_moves(&board, capturing_moves.iter().cloned(), Color::from_hex(0x4287f5));
             draw_moves(&board, castling_moves.iter().map(|(king_to, _, _, _)| king_to.clone()), Color::from_hex(0xda42f5));
+            draw_moves(&board, blocked_moves.into_iter(), Color::from_hex(0xf55442));
         }
 
         if let Some(held_piece) = maybe_held_piece {
             if let Some(Some(piece)) = board.pieces.get(board.get_piece_index(held_piece.position)) {
-                match current_player {
+                match board.current_player {
                     Faction::White => draw_texture_ex(textures.get_texture(*piece), mouse_position.x - 50.0 + held_piece.offset.x, mouse_position.y - 50.0 + held_piece.offset.y, WHITE, DrawTextureParams {dest_size: Some(Vec2::splat(100.0)), ..Default::default()}),
                     Faction::Black => draw_texture_ex(textures.get_texture(*piece), mouse_position.x - 50.0 + held_piece.offset.x, mouse_position.y - 50.0 + held_piece.offset.y, WHITE, DrawTextureParams {dest_size: Some(Vec2::splat(100.0)), ..Default::default()}),
                 }
@@ -588,7 +746,7 @@ pub async fn main() {
 
         let mut maybe_current_move: Option<Move> = None;
         if let (Some(held_piece), true) = (maybe_held_piece, !is_mouse_button_down(MouseButton::Left)) {
-            if let (Some(position), Some(moves), Some(castling_moves), Some(capturing_moves), true) = (maybe_position, &maybe_moves, &maybe_castling_moves, &maybe_capturing_moves, held_piece.piece.get_faction() == current_player) {
+            if let (Some(position), Some(moves), Some(castling_moves), Some(capturing_moves), true) = (maybe_position, &maybe_moves, &maybe_castling_moves, &maybe_capturing_moves, held_piece.piece.get_faction() == board.current_player) {
                 if moves.contains(&position) {
                     board.move_piece(held_piece.position, position);
                     maybe_current_move = Some(Move::Move(held_piece.piece, held_piece.position, position));
@@ -623,43 +781,38 @@ pub async fn main() {
             }
         }
 
-        if is_key_pressed(KeyCode::Z) {
-            if board.events.len() > 0 {
-                current_player = match current_player {
-                    Faction::White => Faction::Black,
-                    Faction::Black => Faction::White
-                };
-            }
+        if auto_undo.is_waiting() {
+            auto_undo.wait(get_frame_time());
+        }
 
-            while let Some(event) = board.events.pop() {
-                match event {
-                    Event::Move(Move::Move(_piece, from, to)) => {
-                        board.move_piece(to, from);
-                        break;
-                    },
-                    Event::Move(Move::Castle(_king, king_from, king_to, _rook, rook_from, rook_to)) => {
-                        board.move_piece(king_to, king_from);
-                        board.move_piece(rook_to, rook_from);
-                        break;
-                    },
-                    Event::Move(Move::Capture(_, from, to, victim)) => {
-                        board.move_piece(to, from);
-                        board.add_piece(to, victim);
-                        break;
-                    }
-                    Event::BlockWhiteKingSideCastle => board.white_king_side_castle_possible = true,
-                    Event::BlockWhiteQueenSideCastle => board.white_queen_side_castle_possible = true,
-                    Event::BlockBlackKingSideCastle => board.black_king_side_castle_possible = true,
-                    Event::BlockBlackQueenSideCastle => board.black_queen_side_castle_possible = true
-                }
+        if is_key_pressed(KeyCode::R) && !auto_undo.is_waiting() && board.events.len() > 0 {
+            auto_undo = AutoUndo::Waiting(auto_undo_delay);
+        }
+
+        if is_key_pressed(KeyCode::Z) && !auto_undo.is_waiting() || auto_undo.is_ready() {
+            if board.events.len() > 0 {
+                board.switch_player();
+            }
+            board.undo();
+            if auto_undo.is_ready() && board.events.len() > 0 {
+                auto_undo = AutoUndo::Waiting(auto_undo_delay);
+            } else if auto_undo.is_ready() {
+                auto_undo = AutoUndo::Idle;
             }
         }
 
         if maybe_current_move.is_some() {
-            current_player = match current_player {
-                Faction::White => Faction::Black,
-                Faction::Black => Faction::White
-            };
+            if board.is_in_check(board.current_player) {
+                panic!("Moved into check (SHOULD BE IMPOSSIBLE)");
+            }
+            board.switch_player();
+        }
+
+        match board.game_state {
+            GameState::Nominal => (),
+            GameState::WhiteCheckmated => {draw_text("Checkmate!", 0.0, 0.0, 20.0, WHITE);},
+            GameState::BlackCheckmated => {draw_text("Checkmate!", 0.0, 0.0, 20.0, BLACK);},
+            GameState::Statemate => {draw_text("Stalemate", 0.0, 0.0, 20.0, GRAY);},
         }
         
         next_frame().await;
