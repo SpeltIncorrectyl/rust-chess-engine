@@ -264,6 +264,10 @@ impl Board {
 
         return check_moves.contains(&position);
     }
+
+    pub fn get_moves(position: UVec2) -> (Vec<UVec2>, Vec<(UVec2, UVec2, UVec2)>, Vec<UVec2>, Vec<UVec2>) {
+        
+    }
 }
 
 pub enum Directions {
@@ -709,16 +713,16 @@ pub async fn main() {
                         return !blocked;
                     });
 
-                    if board.game_state == GameState::Nominal && moves.len() == 0 && capturing_moves.len() == 0 && capturing_moves.len() == 0 {
-                        if board.current_player == Faction::White && board.is_in_check(Faction::White) {
-                            board.game_state = GameState::WhiteCheckmated;
-                        } else if board.current_player == Faction::Black && board.is_in_check(Faction::Black) {
-                            board.game_state = GameState::BlackCheckmated; 
-                        } else {
-                            board.game_state = GameState::Statemate;
-                        }
-                        board.events.push(Event::GameEnded);
-                    }
+                    // if board.game_state == GameState::Nominal && moves.len() == 0 && capturing_moves.len() == 0 && capturing_moves.len() == 0 {
+                    //     if board.current_player == Faction::White && board.is_in_check(Faction::White) {
+                    //         board.game_state = GameState::WhiteCheckmated;
+                    //     } else if board.current_player == Faction::Black && board.is_in_check(Faction::Black) {
+                    //         board.game_state = GameState::BlackCheckmated; 
+                    //     } else {
+                    //         board.game_state = GameState::Statemate;
+                    //     }
+                    //     board.events.push(Event::GameEnded);
+                    // }
 
                     maybe_moves = Some(moves);
                     maybe_castling_moves = Some(castling_moves);
@@ -727,6 +731,8 @@ pub async fn main() {
                 }
             }
         }
+
+        
 
         if let (Some(moves), Some(castling_moves), Some(capturing_moves), Some(blocked_moves)) = (&maybe_moves, &maybe_castling_moves, &maybe_capturing_moves, maybe_blocked_moves) {
             draw_moves(&board, moves.iter().cloned(), Color::from_hex(0x7df5b3));
@@ -808,11 +814,16 @@ pub async fn main() {
             board.switch_player();
         }
 
+        fn draw_text_top(message: &str, color: Color) {
+            let size = measure_text(message, None, 100, 1.0);
+            draw_text(message, screen_width() / 2.0 - size.width / 2.0, size.height + 20.0, 100.0, color);
+        }
+
         match board.game_state {
             GameState::Nominal => (),
-            GameState::WhiteCheckmated => {draw_text("Checkmate!", 0.0, 0.0, 20.0, WHITE);},
-            GameState::BlackCheckmated => {draw_text("Checkmate!", 0.0, 0.0, 20.0, BLACK);},
-            GameState::Statemate => {draw_text("Stalemate", 0.0, 0.0, 20.0, GRAY);},
+            GameState::WhiteCheckmated => draw_text_top("Black Wins!", BLACK),
+            GameState::BlackCheckmated => draw_text_top("White Wins!", WHITE),
+            GameState::Statemate => draw_text_top("Stalemate", GRAY),
         }
         
         next_frame().await;
