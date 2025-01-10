@@ -205,22 +205,22 @@ impl Board {
         return displaced_piece;
     }
 
-    pub fn undo(&mut self) {
+    pub fn undo(&mut self) -> UndoResult {
         while let Some(event) = self.events.pop() {
             match event {
                 Event::Move(Move::Move(_piece, from, to)) => {
                     self.move_piece(to, from);
-                    break;
+                    return UndoResult::PlayerSwitchingEvent;
                 },
                 Event::Move(Move::Castle(_king, king_from, king_to, _rook, rook_from, rook_to)) => {
                     self.move_piece(king_to, king_from);
                     self.move_piece(rook_to, rook_from);
-                    break;
+                    return UndoResult::PlayerSwitchingEvent;
                 },
                 Event::Move(Move::Capture(_, from, to, victim)) => {
                     self.move_piece(to, from);
                     self.add_piece(to, victim);
-                    break;
+                    return UndoResult::PlayerSwitchingEvent;
                 }
                 Event::BlockWhiteKingSideCastle => self.white_king_side_castle_possible = true,
                 Event::BlockWhiteQueenSideCastle => self.white_queen_side_castle_possible = true,
@@ -229,6 +229,8 @@ impl Board {
                 Event::GameEnded => self.game_state = GameState::Nominal
             }
         }
+
+        return UndoResult::Otherwise;
     }
 
     pub fn switch_player(&mut self) {
@@ -265,8 +267,63 @@ impl Board {
         return check_moves.contains(&position);
     }
 
-    pub fn get_moves(position: UVec2) -> (Vec<UVec2>, Vec<(UVec2, UVec2, UVec2)>, Vec<UVec2>, Vec<UVec2>) {
-        
+    pub fn generate_moves(&mut self, tile: UVec2) -> Option<(Moves, CapturingMoves, CastlingMoves, BlockedMoves)> {
+        let Some(piece) = self.get_piece(tile) else {return None};
+
+        let mut blocked_moves = Vec::new();
+        let mut moves = piece.get_movement_destinations(&self, tile);
+        moves.retain(|potential_move| {
+            self.move_piece(tile, *potential_move);
+            let blocked = self.is_in_check(self.current_player);
+            self.move_piece(*potential_move, tile);
+            if blocked {
+                blocked_moves.push(*potential_move);
+            }
+            return !blocked;
+        });
+
+        let mut capturing_moves = piece.get_capure_destinations(&self, tile, ObstructionHandling::Capture);
+        capturing_moves.retain(|potential_move| {
+            let maybe_defeated = self.move_piece(tile, *potential_move);
+            let blocked = self.is_in_check(self.current_player);
+            self.move_piece(*potential_move, tile);
+            if let Some(defeated) = maybe_defeated {
+                self.add_piece(*potential_move, defeated);
+            }
+            if blocked {
+                blocked_moves.push(*potential_move);
+            }
+            return !blocked;
+        });
+
+        let mut castling_moves = piece.get_castling_destinations(&self);
+        castling_moves.retain(|(king_to, _, rook_from, rook_to)| {
+            self.move_piece(tile, *king_to);
+            self.move_piece(*rook_from, *rook_to);
+            let blocked = self.is_in_check(self.current_player);
+            self.move_piece(*king_to, tile);
+            self.move_piece(*rook_to, *rook_from);
+            if blocked {
+                blocked_moves.push(*king_to);
+            }
+            return !blocked;
+        });
+
+        return Some((moves, capturing_moves, castling_moves, blocked_moves));
+    }
+}
+
+pub enum UndoResult {
+    PlayerSwitchingEvent,
+    Otherwise
+}
+
+impl UndoResult {
+    pub fn should_switch_player(&self) -> bool {
+        match self {
+            UndoResult::PlayerSwitchingEvent => true,
+            UndoResult::Otherwise => false
+        }
     }
 }
 
@@ -619,6 +676,11 @@ impl AutoUndo {
     }
 }
 
+type Moves = Vec<UVec2>;
+type CastlingMoves = Vec<(UVec2, Piece, UVec2, UVec2)>;
+type CapturingMoves = Vec<UVec2>;
+type BlockedMoves = Vec<UVec2>;
+
 #[macroquad::main(get_conf)]
 pub async fn main() {
     while screen_width() == 1.0 {
@@ -649,8 +711,8 @@ pub async fn main() {
             }
         }
 
-        if let (None, true, Some(position)) = (maybe_held_piece, is_mouse_button_pressed(MouseButton::Left), maybe_position) {
-        if let Some(piece) = board.get_piece(position) {
+        if let (None, true, Some(position), GameState::Nominal) = (maybe_held_piece, is_mouse_button_pressed(MouseButton::Left), maybe_position, &board.game_state) {
+            if let Some(piece) = board.get_piece(position) {
                 if piece.get_faction() == board.current_player {
                     maybe_held_piece = Some(HeldPiece::new(maybe_position.unwrap(), board.get_tile_position(maybe_position.unwrap()) - mouse_position, piece));
                 }
@@ -660,85 +722,34 @@ pub async fn main() {
         board.draw_board();
         board.draw_pieces(&textures, Vec2::splat(100.0), maybe_held_piece.map(|piece| piece.position));
 
-        let maybe_drawn_moves_piece = match (maybe_held_piece, maybe_position) {
-            (Some(piece), _) => Some(piece.position),
-            (None, Some(position)) => Some(position),
+        let mut maybe_hovered_piece: Option<(UVec2, Piece)> = None;
+        if let Some(position) = maybe_position {
+            if let Some(piece) = board.get_piece(position) {
+                maybe_hovered_piece = Some((position, piece));
+            }
+        }
+        let maybe_selected_piece_moves: Option<(Moves, CapturingMoves, CastlingMoves, BlockedMoves)> = match (&maybe_held_piece, &maybe_hovered_piece) {
+            (Some(piece), _) if piece.piece.get_faction() == board.current_player => board.generate_moves(piece.position),
+            (None, Some((position, piece))) if piece.get_faction() == board.current_player => board.generate_moves(*position),
             _ => None
         };
 
-        let mut maybe_moves: Option<Vec<UVec2>> = None;
-        let mut maybe_castling_moves: Option<Vec<(UVec2, Piece, UVec2, UVec2)>> = None;
-        let mut maybe_capturing_moves: Option<Vec<UVec2>> = None;
-        let mut maybe_blocked_moves: Option<Vec<UVec2>> = None;
-        if let Some(drawn_moves_piece) = maybe_drawn_moves_piece {
-            if let Some(piece) = board.get_piece(drawn_moves_piece) {
-                if piece.get_faction() == board.current_player {
-                    let mut blocked_moves = Vec::new();
-
-                    let mut moves = piece.get_movement_destinations(&board, drawn_moves_piece);
-                    moves.retain(|potential_move| {
-                        board.move_piece(drawn_moves_piece, *potential_move);
-                        let blocked = board.is_in_check(board.current_player);
-                        board.move_piece(*potential_move, drawn_moves_piece);
-                        if blocked {
-                            blocked_moves.push(*potential_move);
-                        }
-                        return !blocked;
-                    });
-
-                    let mut capturing_moves = piece.get_capure_destinations(&board, drawn_moves_piece, ObstructionHandling::Capture);
-                    capturing_moves.retain(|potential_move| {
-                        let maybe_defeated = board.move_piece(drawn_moves_piece, *potential_move);
-                        let blocked = board.is_in_check(board.current_player);
-                        board.move_piece(*potential_move, drawn_moves_piece);
-                        if let Some(defeated) = maybe_defeated {
-                            board.add_piece(*potential_move, defeated);
-                        }
-                        if blocked {
-                            blocked_moves.push(*potential_move);
-                        }
-                        return !blocked;
-                    });
-
-                    let mut castling_moves = piece.get_castling_destinations(&board);
-                    castling_moves.retain(|(king_to, _, rook_from, rook_to)| {
-                        board.move_piece(drawn_moves_piece, *king_to);
-                        board.move_piece(*rook_from, *rook_to);
-                        let blocked = board.is_in_check(board.current_player);
-                        board.move_piece(*king_to, drawn_moves_piece);
-                        board.move_piece(*rook_to, *rook_from);
-                        if blocked {
-                            blocked_moves.push(*king_to);
-                        }
-                        return !blocked;
-                    });
-
-                    // if board.game_state == GameState::Nominal && moves.len() == 0 && capturing_moves.len() == 0 && capturing_moves.len() == 0 {
-                    //     if board.current_player == Faction::White && board.is_in_check(Faction::White) {
-                    //         board.game_state = GameState::WhiteCheckmated;
-                    //     } else if board.current_player == Faction::Black && board.is_in_check(Faction::Black) {
-                    //         board.game_state = GameState::BlackCheckmated; 
-                    //     } else {
-                    //         board.game_state = GameState::Statemate;
-                    //     }
-                    //     board.events.push(Event::GameEnded);
-                    // }
-
-                    maybe_moves = Some(moves);
-                    maybe_castling_moves = Some(castling_moves);
-                    maybe_capturing_moves = Some(capturing_moves);
-                    maybe_blocked_moves = Some(blocked_moves);
-                }
+        if let (GameState::Nominal, Some((0, 0, 0))) = (&board.game_state, maybe_selected_piece_moves.as_ref().map(|(a, b, c, _)| (a.len(), b.len(), c.len()))) {
+            if board.current_player == Faction::White && board.is_in_check(Faction::White) {
+                board.game_state = GameState::WhiteCheckmated;
+            } else if board.current_player == Faction::Black && board.is_in_check(Faction::Black) {
+                board.game_state = GameState::BlackCheckmated; 
+            } else {
+                board.game_state = GameState::Statemate;
             }
+            board.events.push(Event::GameEnded);
         }
 
-        
-
-        if let (Some(moves), Some(castling_moves), Some(capturing_moves), Some(blocked_moves)) = (&maybe_moves, &maybe_castling_moves, &maybe_capturing_moves, maybe_blocked_moves) {
+        if let (Some((moves, capturing_moves, castling_moves, blocked_moves)), GameState::Nominal) = (&maybe_selected_piece_moves, &board.game_state) {
             draw_moves(&board, moves.iter().cloned(), Color::from_hex(0x7df5b3));
             draw_moves(&board, capturing_moves.iter().cloned(), Color::from_hex(0x4287f5));
             draw_moves(&board, castling_moves.iter().map(|(king_to, _, _, _)| king_to.clone()), Color::from_hex(0xda42f5));
-            draw_moves(&board, blocked_moves.into_iter(), Color::from_hex(0xf55442));
+            draw_moves(&board, blocked_moves.iter().cloned(), Color::from_hex(0xf55442));
         }
 
         if let Some(held_piece) = maybe_held_piece {
@@ -752,17 +763,17 @@ pub async fn main() {
 
         let mut maybe_current_move: Option<Move> = None;
         if let (Some(held_piece), true) = (maybe_held_piece, !is_mouse_button_down(MouseButton::Left)) {
-            if let (Some(position), Some(moves), Some(castling_moves), Some(capturing_moves), true) = (maybe_position, &maybe_moves, &maybe_castling_moves, &maybe_capturing_moves, held_piece.piece.get_faction() == board.current_player) {
-                if moves.contains(&position) {
-                    board.move_piece(held_piece.position, position);
-                    maybe_current_move = Some(Move::Move(held_piece.piece, held_piece.position, position));
-                } else if let Some((king_to, rook, rook_from, rook_to)) = castling_moves.iter().filter(|(king_to, _, _, _)| *king_to == position).next() {
-                    board.move_piece(held_piece.position, position);
+            if let (Some(position), Some((moves, capturing_moves, castling_moves, _)), GameState::Nominal) = (&maybe_position, &maybe_selected_piece_moves, &board.game_state) {
+                if moves.contains(position) {
+                    board.move_piece(held_piece.position, *position);
+                    maybe_current_move = Some(Move::Move(held_piece.piece, held_piece.position, *position));
+                } else if let Some((king_to, rook, rook_from, rook_to)) = castling_moves.iter().filter(|(king_to, _, _, _)| *king_to == *position).next() {
+                    board.move_piece(held_piece.position, *position);
                     board.move_piece(*rook_from, *rook_to);
                     maybe_current_move = Some(Move::Castle(held_piece.piece, held_piece.position, *king_to, *rook, *rook_from, *rook_to));
                 } else if capturing_moves.contains(&position) {
-                    if let Some(captured_piece) = board.move_piece(held_piece.position, position) {
-                        maybe_current_move = Some(Move::Capture(held_piece.piece, held_piece.position, position, captured_piece));
+                    if let Some(captured_piece) = board.move_piece(held_piece.position, *position) {
+                        maybe_current_move = Some(Move::Capture(held_piece.piece, held_piece.position, *position, captured_piece));
                     }
                 }
             }
@@ -796,10 +807,9 @@ pub async fn main() {
         }
 
         if is_key_pressed(KeyCode::Z) && !auto_undo.is_waiting() || auto_undo.is_ready() {
-            if board.events.len() > 0 {
+            if board.undo().should_switch_player() {
                 board.switch_player();
             }
-            board.undo();
             if auto_undo.is_ready() && board.events.len() > 0 {
                 auto_undo = AutoUndo::Waiting(auto_undo_delay);
             } else if auto_undo.is_ready() {
