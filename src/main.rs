@@ -311,6 +311,27 @@ impl Board {
 
         return Some((moves, capturing_moves, castling_moves, blocked_moves));
     }
+
+    pub fn iter_all_pieces(&self) -> impl Iterator<Item=(UVec2, Piece)> {
+        let mut results: Vec<(UVec2, Piece)> = Vec::new();
+        for y in 0..self.horizontal_cell_count {
+            for x in 0..self.vertical_cell_count {
+                let position = UVec2::new(x, y);
+                if let Some(piece) = self.get_piece(position) {
+                    results.push((position, piece));
+                }
+            }
+        }
+        return results.into_iter();
+    }
+
+    pub fn iter_all_pieces_of_faction(&self, faction: Faction) -> impl Iterator<Item=(UVec2, Piece)> {
+        self.iter_all_pieces().filter(move |(_, piece)| piece.get_faction() == faction)
+    }
+
+    pub fn generate_all_faction_moves(&mut self, faction: Faction) -> Vec<(Moves, CapturingMoves, CastlingMoves, BlockedMoves)> {
+        self.iter_all_pieces_of_faction(faction).filter_map(|(position, _)| self.generate_moves(position)).collect()
+    }
 }
 
 pub enum UndoResult {
@@ -734,17 +755,6 @@ pub async fn main() {
             _ => None
         };
 
-        if let (GameState::Nominal, Some((0, 0, 0))) = (&board.game_state, maybe_selected_piece_moves.as_ref().map(|(a, b, c, _)| (a.len(), b.len(), c.len()))) {
-            if board.current_player == Faction::White && board.is_in_check(Faction::White) {
-                board.game_state = GameState::WhiteCheckmated;
-            } else if board.current_player == Faction::Black && board.is_in_check(Faction::Black) {
-                board.game_state = GameState::BlackCheckmated; 
-            } else {
-                board.game_state = GameState::Statemate;
-            }
-            board.events.push(Event::GameEnded);
-        }
-
         if let (Some((moves, capturing_moves, castling_moves, blocked_moves)), GameState::Nominal) = (&maybe_selected_piece_moves, &board.game_state) {
             draw_moves(&board, moves.iter().cloned(), Color::from_hex(0x7df5b3));
             draw_moves(&board, capturing_moves.iter().cloned(), Color::from_hex(0x4287f5));
@@ -798,6 +808,31 @@ pub async fn main() {
             }
         }
 
+        if maybe_current_move.is_some() {
+            if board.is_in_check(board.current_player) {
+                panic!("Moved into check (SHOULD BE IMPOSSIBLE)");
+            }
+            board.switch_player();
+        }
+
+        let was_nominal = board.game_state == GameState::Nominal;
+
+        if board.game_state == GameState::Nominal {
+            let current_player_moves = board.generate_all_faction_moves(board.current_player);
+            if current_player_moves.iter().all(|(moves, capturing_moves, castling_moves, _)| moves.len() == 0 && capturing_moves.len() == 0 && castling_moves.len() == 0) {
+                match (board.current_player, board.is_in_check(Faction::White), board.is_in_check(Faction::Black)) {
+                    (Faction::White, true, _) => board.game_state = GameState::WhiteCheckmated,
+                    (Faction::Black, _, true) => board.game_state = GameState::BlackCheckmated,
+                    (Faction::White, false, _) => board.game_state = GameState::Statemate,
+                    (Faction::Black, _, false) => board.game_state = GameState::Statemate
+                }
+            }
+        }
+
+        if was_nominal && board.game_state != GameState::Nominal {
+            board.events.push(Event::GameEnded);
+        }
+
         if auto_undo.is_waiting() {
             auto_undo.wait(get_frame_time());
         }
@@ -815,13 +850,6 @@ pub async fn main() {
             } else if auto_undo.is_ready() {
                 auto_undo = AutoUndo::Idle;
             }
-        }
-
-        if maybe_current_move.is_some() {
-            if board.is_in_check(board.current_player) {
-                panic!("Moved into check (SHOULD BE IMPOSSIBLE)");
-            }
-            board.switch_player();
         }
 
         fn draw_text_top(message: &str, color: Color) {
